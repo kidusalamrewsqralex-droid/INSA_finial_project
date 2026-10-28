@@ -16,7 +16,7 @@ This repo contains all the necessary files for my INSA graduation project
 # Stager generation (in Linux)
 
 1. Go to the project directory.
-2. Use "Python3 builder.py -l <IP> -p <PORT>" to generate the stager.
+2. Use "Python3 builder.py -l "<IP>" -p "<PORT>" " to generate the stager.
 3. Done
 
 
